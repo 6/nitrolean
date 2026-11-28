@@ -34,7 +34,7 @@ impl<'e> Nbe<'e> {
 
     #[inline]
     pub fn whnf_core(&mut self, v: V, cheap_rec: bool, cheap_proj: bool) -> R<V> {
-        if self.a.r(v).core_normal() {
+        if self.a.core_normal(v) {
             return Ok(v);
         }
         self.whnf_core_non_normal(v, cheap_rec, cheap_proj)
@@ -43,14 +43,13 @@ impl<'e> Nbe<'e> {
     /// Core reduction after the original value's normal flag has been checked.
     #[inline]
     fn whnf_core_non_normal(&mut self, mut v: V, cheap_rec: bool, cheap_proj: bool) -> R<V> {
-        let mut rec = self.a.r(v);
-        if rec.is_thunk() {
+        if self.a.is_thunk(v) {
             v = self.force(v);
-            rec = self.a.r(v);
-            if rec.core_normal() {
+            if self.a.core_normal(v) {
                 return Ok(v);
             }
         }
+        let rec = self.a.r(v);
         if !cheap_rec {
             let c = if cheap_proj {
                 rec.cheap_core()
@@ -75,7 +74,7 @@ impl<'e> Nbe<'e> {
                     self.whnf_core(r, cheap_rec, cheap_proj)?
                 }
                 None => {
-                    self.a.rm(v).set_whnf_normal();
+                    self.a.set_whnf_normal(v);
                     return Ok(v);
                 }
             },
@@ -107,7 +106,7 @@ impl<'e> Nbe<'e> {
         if !is_rec {
             if !has_proj {
                 if d.is_some() {
-                    self.a.rm(v).set_core_normal();
+                    self.a.set_core_normal(v);
                 }
                 return Ok(v);
             }
@@ -139,7 +138,7 @@ impl<'e> Nbe<'e> {
             let x = self.a.mk(Val::Const(c, l, pre));
             if !is_rec && d.is_some() {
                 // The prefix has only arguments and its head cannot reduce in core.
-                self.a.rm(x).set_core_normal();
+                self.a.set_core_normal(x);
             }
             let x = if cheap_proj {
                 self.whnf_core(x, cheap_rec, cheap_proj)?
@@ -616,7 +615,7 @@ impl<'e> Nbe<'e> {
 
     /// The definition at the head of a value already forced by core reduction.
     pub(super) fn delta_definition_forced(&self, v: V) -> Option<&'e Decl> {
-        debug_assert!(!self.a.r(v).is_thunk());
+        debug_assert!(!self.a.is_thunk(v));
         self.delta_head(v).map(|(d, _, _)| d)
     }
 
@@ -649,7 +648,7 @@ impl<'e> Nbe<'e> {
 
     /// Take the chosen lazy delta step on a forced value with validated metadata.
     pub(super) fn unfold_cheap(&mut self, v: V, d: &Decl) -> R<V> {
-        debug_assert!(!self.a.r(v).is_thunk());
+        debug_assert!(!self.a.is_thunk(v));
         let m = self.a.r(v).delta;
         let r = if m != NONE {
             V(m)
@@ -957,7 +956,7 @@ impl<'e> Nbe<'e> {
 
     #[inline]
     pub fn whnf(&mut self, v: V) -> R<V> {
-        if self.a.r(v).whnf_normal() {
+        if self.a.whnf_normal(v) {
             return Ok(v);
         }
         self.whnf_slow(v)
@@ -965,7 +964,7 @@ impl<'e> Nbe<'e> {
 
     fn whnf_slow(&mut self, v: V) -> R<V> {
         let v = self.force(v);
-        if self.a.r(v).whnf_normal() {
+        if self.a.whnf_normal(v) {
             return Ok(v);
         }
         let c = self.a.r(v).whnf;
@@ -975,7 +974,7 @@ impl<'e> Nbe<'e> {
         if let Val::FVar(k, _) = self.a.get(v)
             && self.let_value(k).is_none()
         {
-            self.a.rm(v).set_whnf_normal();
+            self.a.set_whnf_normal(v);
             return Ok(v);
         }
         if self.stable_queries.is_some() && !self.eval_probe && !self.a.has_fvar(v) {
@@ -1006,18 +1005,18 @@ impl<'e> Nbe<'e> {
         let mut first = eval;
         let n = loop {
             self.tick()?;
-            let rec = self.a.r(t);
-            if rec.whnf_normal() {
+            if self.a.whnf_normal(t) {
                 break t;
             }
-            if rec.whnf != NONE {
-                break V(rec.whnf);
+            let w = self.a.r(t).whnf;
+            if w != NONE {
+                break V(w);
             }
-            let t_l = if rec.core_normal() {
+            let t_l = if self.a.core_normal(t) {
                 t
             } else {
                 let r = self.whnf_core_non_normal(t, false, false)?;
-                if self.a.r(r).whnf_normal() {
+                if self.a.whnf_normal(r) {
                     break r;
                 }
                 r

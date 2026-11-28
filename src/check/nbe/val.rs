@@ -48,7 +48,10 @@ impl Ls {
 
 pub const NONE: u32 = u32::MAX;
 
+/// Laid out as `Slot` is (`repr(C, u8)`: the tag byte, then the fields
+/// from byte 4), so that a slot is read as a value with no decoding.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(C, u8)]
 pub enum Val {
     Sort(LevelId),
     Nat(u32, u32),
@@ -66,6 +69,54 @@ pub enum Val {
     Thunk(ExprId, Env, Ls),
     Const(NameId, LevelList, Sp),
     FVar(u32, Sp),
+}
+
+/// A value as stored: its tag, its flags in the byte after it (where a
+/// `Val` has padding), and its fields, unused ones zero.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Slot {
+    tag: u8,
+    flags: u8,
+    pad: [u8; 2],
+    w: [u32; 3],
+}
+
+const _: () = assert!(size_of::<Slot>() == 16 && size_of::<Val>() == 16);
+
+impl Slot {
+    #[inline]
+    fn of(val: Val, flags: u8) -> Slot {
+        let (tag, w) = match val {
+            Val::Sort(l) => (0, [l.0, 0, 0]),
+            Val::Nat(lo, hi) => (1, [lo, hi, 0]),
+            Val::NatBig(i) => (2, [i, 0, 0]),
+            Val::Str(x) => (3, [x.0, 0, 0]),
+            Val::Lam(e, env, ls) => (4, [e.0, env.0, ls.0]),
+            Val::Pi(e, env, ls) => (5, [e.0, env.0, ls.0]),
+            Val::PiInfer(e, env, ls) => (6, [e.0, env.0, ls.0]),
+            Val::Thunk(e, env, ls) => (7, [e.0, env.0, ls.0]),
+            Val::Const(n, l, sp) => (8, [n.0, l.0, sp.0]),
+            Val::FVar(k, sp) => (9, [k, sp.0, 0]),
+        };
+        let s = Slot {
+            tag,
+            flags,
+            pad: [0; 2],
+            w,
+        };
+        debug_assert_eq!(s.val(), val);
+        s
+    }
+
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    fn val(self) -> Val {
+        // SAFETY: `Val` is `repr(C, u8)` with fields of `u32`s from byte 4,
+        // and `tag` is the discriminant `of` wrote (declaration order); the
+        // flag and padding bytes fall in `Val`'s padding.
+        unsafe { std::mem::transmute::<Slot, Val>(self) }
+    }
 }
 
 /// A table hash from 32 stored bits, so that growing a table reads no
@@ -200,9 +251,9 @@ pub struct LsNode {
 /// A value with what is known about it.
 #[derive(Clone, Copy)]
 pub struct Rec {
-    /// The low byte holds flags. The upper bits hold the core memo with
-    /// cheap projections, encoded as the value id plus one (zero is empty).
-    flags: u32,
+    /// The core memo with cheap projections, encoded as the value id plus
+    /// one (zero is empty).
+    cheap: u32,
     /// What a thunk evaluates to, or `NONE`; likewise the memos below.
     pub forced: u32,
     pub whnf_core: u32,
@@ -212,46 +263,31 @@ pub struct Rec {
     pub delta: u32,
 }
 
-const HAS_FVAR: u32 = 1;
-const CHECKED: u32 = 2;
-const CORE_NORMAL: u32 = 4;
-const WHNF_NORMAL: u32 = 8;
-const THUNK: u32 = 16;
-const FLAG_BITS: u32 = 8;
-const FLAG_MASK: u32 = (1 << FLAG_BITS) - 1;
+/// Flags of a value (`Slot::flags`).
+const HAS_FVAR: u8 = 1;
+const CHECKED: u8 = 2;
+const CORE_NORMAL: u8 = 4;
+const WHNF_NORMAL: u8 = 8;
+
+/// A record with no memo.
+const EMPTY_REC: Rec = Rec {
+    cheap: 0,
+    forced: NONE,
+    whnf_core: NONE,
+    whnf: NONE,
+    ty: NONE,
+    delta: NONE,
+};
 
 impl Rec {
     #[inline]
     pub(super) fn cheap_core(&self) -> u32 {
-        (self.flags >> FLAG_BITS).wrapping_sub(1)
+        self.cheap.wrapping_sub(1)
     }
 
     #[inline]
     pub(super) fn set_cheap_core(&mut self, v: V) {
-        self.flags = (self.flags & FLAG_MASK) | ((v.0 + 1) << FLAG_BITS);
-    }
-
-    #[inline]
-    pub(super) fn core_normal(&self) -> bool {
-        self.flags & CORE_NORMAL != 0
-    }
-
-    #[inline]
-    pub(super) fn whnf_normal(&self) -> bool {
-        self.flags & WHNF_NORMAL != 0
-    }
-
-    #[inline]
-    pub(super) fn is_thunk(&self) -> bool {
-        self.flags & THUNK != 0
-    }
-
-    pub(super) fn set_core_normal(&mut self) {
-        self.flags |= CORE_NORMAL;
-    }
-
-    pub(super) fn set_whnf_normal(&mut self) {
-        self.flags |= CORE_NORMAL | WHNF_NORMAL;
+        self.cheap = v.0 + 1;
     }
 }
 
@@ -259,7 +295,6 @@ impl Rec {
 /// Past it the evaluating checker gives up on the declaration (by
 /// unwinding with [`OutOfRoom`]) and the substituting one checks it.
 pub(super) const LIMIT: u32 = 1 << 23;
-const _: () = assert!(LIMIT <= u32::MAX >> FLAG_BITS);
 
 /// The most words the spines of one declaration may take.
 const SP_WORDS: usize = 8 << 23;
@@ -276,9 +311,9 @@ fn out_of_room() -> ! {
 
 /// The arena of one worker.
 pub struct Arena {
-    /// The values; what is known about them is in `recs`, apart, so that
-    /// probing `vtable` reads only values.
-    vals: Vec<Val>,
+    /// The values with their flags; the memos about them are in `recs`,
+    /// apart, so that probing `vtable` reads only values.
+    vals: Vec<Slot>,
     recs: Vec<Rec>,
     vtable: Table,
 
@@ -464,7 +499,7 @@ impl Arena {
 
     /// Bytes held, roughly.
     pub fn heap_bytes(&self) -> usize {
-        self.vals.capacity() * size_of::<Val>()
+        self.vals.capacity() * size_of::<Slot>()
             + self.recs.capacity() * size_of::<Rec>()
             + self.vtable.capacity() * 8
             + self.sps.capacity() * 4
@@ -486,7 +521,42 @@ impl Arena {
 
     #[inline]
     pub fn get(&self, v: V) -> Val {
-        *at(&self.vals, v.0 as usize)
+        at(&self.vals, v.0 as usize).val()
+    }
+
+    #[inline]
+    fn flags(&self, v: V) -> u8 {
+        at(&self.vals, v.0 as usize).flags
+    }
+
+    #[inline]
+    fn set_flags(&mut self, v: V, f: u8) {
+        at_mut(&mut self.vals, v.0 as usize).flags |= f;
+    }
+
+    #[inline]
+    pub fn core_normal(&self, v: V) -> bool {
+        self.flags(v) & CORE_NORMAL != 0
+    }
+
+    #[inline]
+    pub fn whnf_normal(&self, v: V) -> bool {
+        self.flags(v) & WHNF_NORMAL != 0
+    }
+
+    #[inline]
+    pub fn is_thunk(&self, v: V) -> bool {
+        matches!(self.get(v), Val::Thunk(..))
+    }
+
+    #[inline]
+    pub fn set_core_normal(&mut self, v: V) {
+        self.set_flags(v, CORE_NORMAL);
+    }
+
+    #[inline]
+    pub fn set_whnf_normal(&mut self, v: V) {
+        self.set_flags(v, CORE_NORMAL | WHNF_NORMAL);
     }
 
     /// What is known about `v`.
@@ -502,22 +572,22 @@ impl Arena {
 
     #[inline]
     pub fn has_fvar(&self, v: V) -> bool {
-        at(&self.recs, v.0 as usize).flags & HAS_FVAR != 0
+        self.flags(v) & HAS_FVAR != 0
     }
 
     #[inline]
     pub fn checked(&self, v: V) -> bool {
-        at(&self.recs, v.0 as usize).flags & CHECKED != 0
+        self.flags(v) & CHECKED != 0
     }
 
     #[inline]
     pub fn set_checked(&mut self, v: V) {
-        at_mut(&mut self.recs, v.0 as usize).flags |= CHECKED;
+        self.set_flags(v, CHECKED);
     }
 
     #[inline]
     pub fn clear_checked(&mut self, v: V) {
-        at_mut(&mut self.recs, v.0 as usize).flags &= !CHECKED;
+        at_mut(&mut self.vals, v.0 as usize).flags &= !CHECKED;
     }
 
     /// `mk(Val::Const(n, l, Sp::NIL))`.
@@ -570,7 +640,7 @@ impl Arena {
         }
         let h = val.hash();
         let Self { vals, vtable, .. } = self;
-        let slot = match vtable.find_or_slot(h, |id| *at(vals, id as usize) == val) {
+        let slot = match vtable.find_or_slot(h, |id| at(vals, id as usize).val() == val) {
             Ok(id) => return V(id),
             Err(slot) => slot,
         };
@@ -579,28 +649,21 @@ impl Arena {
             out_of_room();
         }
         vtable.insert_at(slot, h, id);
-        vals.push(val);
         let flags = match val {
             Val::Lam(_, e, _) | Val::Pi(_, e, _) | Val::PiInfer(_, e, _) => {
                 CORE_NORMAL | WHNF_NORMAL | self.env_flags(e)
             }
             Val::Sort(_) | Val::Nat(..) | Val::NatBig(_) | Val::Str(_) => CORE_NORMAL | WHNF_NORMAL,
-            Val::Thunk(_, e, _) => THUNK | self.env_flags(e),
+            Val::Thunk(_, e, _) => self.env_flags(e),
             Val::Const(..) => CORE_NORMAL,
             Val::FVar(..) => HAS_FVAR,
         };
-        self.recs.push(Rec {
-            flags,
-            forced: NONE,
-            whnf_core: NONE,
-            whnf: NONE,
-            ty: NONE,
-            delta: NONE,
-        });
+        self.vals.push(Slot::of(val, flags));
+        self.recs.push(EMPTY_REC);
         V(id)
     }
 
-    fn env_flags(&self, e: Env) -> u32 {
+    fn env_flags(&self, e: Env) -> u8 {
         if at(&self.envs, e.0 as usize).len & HAS_FVAR_BIT != 0 {
             HAS_FVAR
         } else {
@@ -842,7 +905,7 @@ impl Arena {
         let slot = match nutable.find_or_slot(h, |id| {
             {
                 {
-                    let (same, sp) = match (*at(vals, id as usize), head) {
+                    let (same, sp) = match (at(vals, id as usize).val(), head) {
                         (Val::Const(n2, l2, sp), Val::Const(n1, l1, _)) => {
                             (n1 == n2 && l1 == l2, sp)
                         }
@@ -875,7 +938,9 @@ impl Arena {
                 } else {
                     sps[k - 1] & (HAS_FVAR_BIT | HAS_PROJ_BIT)
                 };
-                let fv = xs.iter().any(|&x| recs[x.0 as usize].flags & HAS_FVAR != 0);
+                let fv = xs
+                    .iter()
+                    .any(|&x| at(vals, x.0 as usize).flags & HAS_FVAR != 0);
                 sps.push((n + xs.len()) as u32 | base | if fv { HAS_FVAR_BIT } else { 0 });
                 // Word by word: spines are short, and a call to copy
                 // memory costs more than the loop.
@@ -898,9 +963,10 @@ impl Arena {
         if id >= LIMIT {
             out_of_room();
         }
-        vals.push(val);
+        let fv = matches!(head, Val::FVar(..)) || sps[sp.0 as usize] & HAS_FVAR_BIT != 0;
+        vals.push(Slot::of(val, if fv { HAS_FVAR } else { 0 }));
         nutable.insert_at(slot, h, id, |id| {
-            let head = *at(vals, id as usize);
+            let head = at(vals, id as usize).val();
             let (Val::Const(_, _, sp) | Val::FVar(_, sp)) = head else {
                 unreachable!()
             };
@@ -908,15 +974,7 @@ impl Arena {
             let n = (*at(sps, k) & LEN_BITS) as usize;
             Self::neutral_hash(head, at_slice(sps, k + 1, k + 1 + n), &[])
         });
-        let fv = matches!(head, Val::FVar(..)) || sps[sp.0 as usize] & HAS_FVAR_BIT != 0;
-        recs.push(Rec {
-            flags: if fv { HAS_FVAR } else { 0 },
-            forced: NONE,
-            whnf_core: NONE,
-            whnf: NONE,
-            ty: NONE,
-            delta: NONE,
-        });
+        recs.push(EMPTY_REC);
         V(id)
     }
 
@@ -1072,7 +1130,7 @@ impl Arena {
             runs,
             envtable,
             env_first,
-            recs,
+            vals,
             ..
         } = self;
         let first = *at(env_first, env.0 as usize);
@@ -1094,7 +1152,7 @@ impl Arena {
             out_of_room();
         }
         let p = *at(envs, env.0 as usize);
-        let fv = p.len & HAS_FVAR_BIT != 0 || at(recs, v.0 as usize).flags & HAS_FVAR != 0;
+        let fv = p.len & HAS_FVAR_BIT != 0 || at(vals, v.0 as usize).flags & HAS_FVAR != 0;
         let seg = p.len >> SEG_SHIFT & SEG_MAX;
         let lp = p.len & ENV_LEN_BITS;
         let (start, seg) = if seg != 0 && seg < SEG_MAX && (p.start + seg) as usize == runs.len() {
