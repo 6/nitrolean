@@ -181,7 +181,8 @@ const SEG_MAX: u32 = (1 << 7) - 1;
 /// of its segment is extended; a longer one becomes the new cell's base.
 const SEG_COPY: u32 = 16;
 const _: () = assert!(LIMIT <= ENV_LEN_BITS + 1 && SEG_SHIFT + 7 < 31);
-/// The most words `Arena::runs` may hold; cells made past it have no
+/// The most words `Arena::runs` may hold before extensions of the last
+/// segment (one word per cell); cells copied or based past it have no
 /// segment, and their entries are found cell by cell.
 const RUN_WORDS: usize = 1 << 24;
 
@@ -1096,13 +1097,13 @@ impl Arena {
         let fv = p.len & HAS_FVAR_BIT != 0 || at(recs, v.0 as usize).flags & HAS_FVAR != 0;
         let seg = p.len >> SEG_SHIFT & SEG_MAX;
         let lp = p.len & ENV_LEN_BITS;
-        let (start, seg) = if seg == 0 && lp != 0 || runs.len() + SEG_COPY as usize + 2 > RUN_WORDS
-        {
-            // Past `RUN_WORDS`, or on a cell with none: no segment.
-            (0, 0)
-        } else if seg != 0 && seg < SEG_MAX && (p.start + seg) as usize == runs.len() {
+        let (start, seg) = if seg != 0 && seg < SEG_MAX && (p.start + seg) as usize == runs.len() {
+            // One word a cell at most: past `RUN_WORDS`, at most `LIMIT`.
             runs.push(v);
             (p.start, seg + 1)
+        } else if seg == 0 && lp != 0 || runs.len() + SEG_COPY as usize + 2 > RUN_WORDS {
+            // Past `RUN_WORDS`, or on a cell with none: no segment.
+            (0, 0)
         } else if seg != 0 && seg <= SEG_COPY {
             let s = p.start as usize;
             runs.push(*at(runs, s - 1));
