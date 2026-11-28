@@ -157,16 +157,33 @@ struct EnvNode {
     v: V,
 }
 
-/// An environment cell with its length and `HAS_FVAR_BIT`, and a jump
-/// to an outer cell: the skew-binary jump pointers of Myers, "An
-/// applicative random-access stack" (1983), which find the variable at
-/// depth `i` in O(log i) steps.
+/// An environment cell: its length with `HAS_FVAR_BIT` and the length
+/// of its segment (`SEG_SHIFT`), and where that segment starts in
+/// `Arena::runs`. A segment holds the cell's innermost entries, outermost
+/// first, and is preceded by the cell it extends (its base), which holds
+/// the entries past it; so the variable at depth `i` is read with one
+/// load below the segment's length, and one more per base past it.
+/// A cell with a length but no segment length has no segment
+/// (`RUN_WORDS`).
 #[derive(Clone, Copy)]
 struct EnvRec {
     node: EnvNode,
     len: u32,
-    jump: Env,
+    start: u32,
 }
+
+/// Where the segment length is in `EnvRec::len`, above the length.
+const SEG_SHIFT: u32 = 23;
+const ENV_LEN_BITS: u32 = (1 << SEG_SHIFT) - 1;
+/// The longest segment.
+const SEG_MAX: u32 = (1 << 7) - 1;
+/// Segments up to this length are copied when a cell other than the last
+/// of its segment is extended; a longer one becomes the new cell's base.
+const SEG_COPY: u32 = 16;
+const _: () = assert!(LIMIT <= ENV_LEN_BITS + 1 && SEG_SHIFT + 7 < 31);
+/// The most words `Arena::runs` may hold; cells made past it have no
+/// segment, and their entries are found cell by cell.
+const RUN_WORDS: usize = 1 << 24;
 
 const HAS_FVAR_BIT: u32 = 1 << 31;
 const HAS_PROJ_BIT: u32 = 1 << 30;
@@ -279,6 +296,10 @@ pub struct Arena {
     /// Scratch words for building a spine.
     sp_buf: Vec<u32>,
     envs: Vec<EnvRec>,
+    /// The segments of environments (`EnvRec`), each after the id of its
+    /// base: a cell made on the last cell of a segment that ends the vector
+    /// extends that segment.
+    runs: Vec<V>,
     /// The first cell made on each cell, or 0: such a cell is not in
     /// `envtable`, and a cell with none is known to have no child.
     env_first: Vec<u32>,
@@ -312,8 +333,6 @@ pub struct Arena {
     /// Neutrals projected (`neutral_proj`): (neutral, structure, field,
     /// result).
     projs: Box<[[u32; 4]; PROJS]>,
-    /// Far variables found (`lookup`): (environment, index, value).
-    fars: Box<[std::cell::Cell<[u32; 3]>; FARS]>,
 }
 
 /// The neutral `head` with the spine `sp` in place of its own.
@@ -340,9 +359,6 @@ const APPS: usize = 1 << 11;
 /// Slots of `Arena::const_apps` and of `Arena::const_seen`.
 const CONST_APPS: usize = 1 << 12;
 const CONST_SEEN: usize = 1 << 12;
-
-/// Slots of `Arena::fars`.
-const FARS: usize = 1 << 12;
 
 /// Slots of `Arena::thunks`.
 const THUNKS: usize = 1 << 11;
@@ -372,8 +388,9 @@ impl Arena {
                     v: V(NONE),
                 },
                 len: 0,
-                jump: Env::NIL,
+                start: 0,
             }],
+            runs: Vec::new(),
             envtable: Table32::new(),
             lss: vec![LsNode {
                 params: NameList::default(),
@@ -392,11 +409,6 @@ impl Arena {
             const_seen: table(NONE),
             const_counted: 0,
             projs: table(NONE),
-            fars: (0..FARS)
-                .map(|_| std::cell::Cell::new([NONE; 3]))
-                .collect::<Box<[_]>>()
-                .try_into()
-                .unwrap_or_else(|_| unreachable!()),
         }
     }
 
@@ -428,6 +440,7 @@ impl Arena {
         self.sp_buf.clear();
         self.sptable.clear();
         self.envs.truncate(1);
+        self.runs.clear();
         self.env_first.truncate(1);
         self.env_first[0] = 0;
         self.envtable.clear();
@@ -442,9 +455,6 @@ impl Arena {
         self.const_seen.as_flattened_mut().fill(NONE);
         self.const_counted = 0;
         self.projs.as_flattened_mut().fill(NONE);
-        for f in self.fars.iter() {
-            f.set([NONE; 3]);
-        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -461,6 +471,7 @@ impl Arena {
             + self.projection_table.capacity() * 8
             + self.sptable.capacity() * 8
             + self.envs.capacity() * 17
+            + self.runs.capacity() * size_of::<V>()
             + self.env_first.capacity() * 4
             + self.thunks.len() * 16
             + self.nutable.capacity() * size_of::<u32>()
@@ -1034,7 +1045,7 @@ impl Arena {
 
     #[inline]
     pub fn env_len(&self, e: Env) -> u32 {
-        at(&self.envs, e.0 as usize).len & LEN_BITS
+        at(&self.envs, e.0 as usize).len & ENV_LEN_BITS
     }
 
     #[inline]
@@ -1057,6 +1068,7 @@ impl Arena {
         let node = EnvNode { prev: env, v };
         let Self {
             envs,
+            runs,
             envtable,
             env_first,
             recs,
@@ -1082,12 +1094,28 @@ impl Arena {
         }
         let p = *at(envs, env.0 as usize);
         let fv = p.len & HAS_FVAR_BIT != 0 || at(recs, v.0 as usize).flags & HAS_FVAR != 0;
-        let len = ((p.len & LEN_BITS) + 1) | if fv { HAS_FVAR_BIT } else { 0 };
-        let j = *at(envs, p.jump.0 as usize);
-        let (lp, lj) = (p.len & LEN_BITS, j.len & LEN_BITS);
-        let ljj = at(envs, j.jump.0 as usize).len & LEN_BITS;
-        let jump = if lp - lj == lj - ljj { j.jump } else { env };
-        envs.push(EnvRec { node, len, jump });
+        let seg = p.len >> SEG_SHIFT & SEG_MAX;
+        let lp = p.len & ENV_LEN_BITS;
+        let (start, seg) = if seg == 0 && lp != 0 || runs.len() + SEG_COPY as usize + 2 > RUN_WORDS
+        {
+            // Past `RUN_WORDS`, or on a cell with none: no segment.
+            (0, 0)
+        } else if seg != 0 && seg < SEG_MAX && (p.start + seg) as usize == runs.len() {
+            runs.push(v);
+            (p.start, seg + 1)
+        } else if seg != 0 && seg <= SEG_COPY {
+            let s = p.start as usize;
+            runs.push(*at(runs, s - 1));
+            runs.extend_from_within(s..s + seg as usize);
+            runs.push(v);
+            ((runs.len() - seg as usize - 1) as u32, seg + 1)
+        } else {
+            runs.push(V(env.0));
+            runs.push(v);
+            ((runs.len() - 1) as u32, 1)
+        };
+        let len = (lp + 1) | seg << SEG_SHIFT | if fv { HAS_FVAR_BIT } else { 0 };
+        envs.push(EnvRec { node, len, start });
         env_first.push(0);
         match slot {
             None => *at_mut(env_first, env.0 as usize) = id,
@@ -1109,36 +1137,80 @@ impl Arena {
         at(&self.envs, e.0 as usize).node.prev
     }
 
+    /// The segment of `env` (outermost first) and its base, which holds
+    /// the entries past it: for a cell with no segment, its own entry and
+    /// the rest; for the empty environment, empty.
+    #[inline]
+    pub fn env_seg(&self, e: Env) -> (&[V], Env) {
+        let r = at(&self.envs, e.0 as usize);
+        let seg = (r.len >> SEG_SHIFT & SEG_MAX) as usize;
+        if seg == 0 {
+            if r.len & ENV_LEN_BITS == 0 {
+                return (&[], Env::NIL);
+            }
+            return (std::slice::from_ref(&r.node.v), r.node.prev);
+        }
+        let s = r.start as usize;
+        (
+            at_slice(&self.runs, s, s + seg),
+            Env(at(&self.runs, s - 1).0),
+        )
+    }
+
     /// The value of bound variable `i` (0 is the innermost).
     #[inline]
-    pub fn lookup(&self, env: Env, i: u32) -> Option<V> {
+    pub fn lookup(&self, env: Env, mut i: u32) -> Option<V> {
         let mut r = *at(&self.envs, env.0 as usize);
-        let len = r.len & LEN_BITS;
-        if i >= len {
+        if i >= r.len & ENV_LEN_BITS {
             return None;
         }
-        if i < 8 {
-            for _ in 0..i {
-                r = *at(&self.envs, r.node.prev.0 as usize);
+        loop {
+            let seg = r.len >> SEG_SHIFT & SEG_MAX;
+            if i < seg {
+                return Some(*at(&self.runs, (r.start + seg - 1 - i) as usize));
             }
-            return Some(r.node.v);
+            if seg == 0 {
+                return Some(self.lookup_walk(r, i));
+            }
+            i -= seg;
+            r = *at(&self.envs, at(&self.runs, r.start as usize - 1).0 as usize);
         }
-        let target = len - i;
-        let fi = (crate::hash::hash_front(env.0 as u64, i as u64) >> 52) as usize & (FARS - 1);
-        let f = self.fars[fi].get();
-        if f[0] == env.0 && f[1] == i {
-            return Some(V(f[2]));
-        }
-        while r.len & LEN_BITS != target {
-            let j = *at(&self.envs, r.jump.0 as usize);
-            r = if j.len & LEN_BITS >= target {
-                j
+    }
+
+    /// `lookup` from a cell with no segment: cell by cell to the first
+    /// with one.
+    #[cold]
+    #[inline(never)]
+    fn lookup_walk(&self, mut r: EnvRec, mut i: u32) -> V {
+        loop {
+            let seg = r.len >> SEG_SHIFT & SEG_MAX;
+            if i < seg {
+                return *at(&self.runs, (r.start + seg - 1 - i) as usize);
+            }
+            if seg == 0 {
+                if i == 0 {
+                    return r.node.v;
+                }
+                i -= 1;
+                r = *at(&self.envs, r.node.prev.0 as usize);
             } else {
-                *at(&self.envs, r.node.prev.0 as usize)
-            };
+                i -= seg;
+                r = *at(&self.envs, at(&self.runs, r.start as usize - 1).0 as usize);
+            }
         }
-        self.fars[fi].set([env.0, i, r.node.v.0]);
-        Some(r.node.v)
+    }
+
+    /// Push the first `n` entries of `env` (at most its length), innermost
+    /// first.
+    pub fn push_innermost(&self, mut env: Env, n: u32, out: &mut Vec<V>) {
+        let mut left = n;
+        while left > 0 {
+            let (seg, base) = self.env_seg(env);
+            let take = (seg.len() as u32).min(left) as usize;
+            out.extend(seg[seg.len() - take..].iter().rev());
+            left -= take as u32;
+            env = base;
+        }
     }
 
     /// The first `n` entries of `env`, innermost first.
