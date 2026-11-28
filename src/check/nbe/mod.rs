@@ -95,7 +95,7 @@ const CHECKED_KEEP: usize = 1 << 19;
 
 /// Whether open terms are remembered as checked too, keyed by the binder
 /// types they were checked under (`ctx_of`).
-const OPEN_FACTS: bool = true;
+const OPEN_FACTS: bool = false;
 
 /// Terms read from `.olean` files the store may hold between declarations.
 const READ_KEEP: usize = 1 << 20;
