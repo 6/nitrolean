@@ -280,19 +280,24 @@ impl Nbe<'_> {
         } else {
             (holes & ((1u64 << n) - 1)).count_ones()
         };
-        // One extend of known length, not a check per push.
+        // Segment by segment, innermost first.
         let a = &self.a;
-        words.extend(head.into_iter().chain((0..n - skipped).map(|_| {
-            while mask & 1 != 0 {
+        words.reserve(head.len() + (n - skipped) as usize);
+        words.extend(head);
+        let mut left = n;
+        while left > 0 {
+            let (seg, base) = a.env_seg(cur);
+            let take = (seg.len() as u32).min(left);
+            for &v in seg[seg.len() - take as usize..].iter().rev() {
+                if mask & 1 == 0 {
+                    h = (h.rotate_left(5) ^ v.0 as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
+                    words.push(v.0);
+                }
                 mask >>= 1;
-                cur = a.env_tail(cur);
             }
-            let v = a.env_head(cur);
-            h = (h.rotate_left(5) ^ v.0 as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
-            mask >>= 1;
-            cur = a.env_tail(cur);
-            v.0
-        })));
+            left -= take;
+            cur = base;
+        }
         let end = words.len();
         let len = end - base;
         let h = fold32(h);

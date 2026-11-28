@@ -960,11 +960,7 @@ impl<'e> Nbe<'e> {
         }
         let hole = self.hole();
         let base = self.vargs.len();
-        let mut cur = env;
-        for _ in 0..n {
-            self.vargs.push(self.a.env_head(cur));
-            cur = self.a.env_tail(cur);
-        }
+        self.a.push_innermost(env, n, &mut self.vargs);
         let mut r = val::Env::NIL;
         for j in (0..n as usize).rev() {
             let v = if j < 32 && holes >> j & 1 != 0 {
@@ -1024,11 +1020,7 @@ impl<'e> Nbe<'e> {
             return val::Env(s[2]);
         }
         let base = self.vargs.len();
-        let mut cur = env;
-        for _ in 0..n {
-            self.vargs.push(self.a.env_head(cur));
-            cur = self.a.env_tail(cur);
-        }
+        self.a.push_innermost(env, n, &mut self.vargs);
         let mut r = val::Env::NIL;
         for k in (base..self.vargs.len()).rev() {
             r = self.a.cons(r, *val::at(&self.vargs, k));
